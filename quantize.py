@@ -39,6 +39,11 @@ except ImportError:
         HAS_WATERSIC_LIB = False
 
 
+def to_numpy_f16(t: torch.Tensor) -> np.ndarray:
+    """Safely convert PyTorch tensor (including BF16) to float16 NumPy array."""
+    return t.detach().to(torch.float16).cpu().numpy()
+
+
 def pack_by_bits(codes: np.ndarray, target_bits: int) -> bytes:
     """Select packing routine by target bitrate."""
     if target_bits == 3:
@@ -408,7 +413,7 @@ def run_quantization(
             target_bits=emb_rule["target_bits"]
         )
     else:
-        writer.add_unquantized_tensor("token_embd.weight", embed_tokens.weight.data.cpu().numpy(), "F16")
+        writer.add_unquantized_tensor("token_embd.weight", to_numpy_f16(embed_tokens.weight.data), "F16")
 
     # 6. Progressive Layer-by-Layer Quantization
     num_layers = len(layers)
@@ -501,7 +506,7 @@ def run_quantization(
                     "mod_name": m_name,
                     "action": "keep",
                     "target_bits": 0,
-                    "weight_np": w_orig.cpu().numpy()
+                    "weight_np": to_numpy_f16(w_orig)
                 }
 
         results = []
@@ -539,7 +544,7 @@ def run_quantization(
         for name, param in layer.named_parameters():
             if not any(lin_name in name for lin_name in layer_linears):
                 full_param_name = f"blk.{layer_idx}.{name}"
-                writer.add_unquantized_tensor(full_param_name, param.data.cpu().numpy(), "F16")
+                writer.add_unquantized_tensor(full_param_name, to_numpy_f16(param.data), "F16")
 
         # Forward pass updated activations for next layer
         with torch.no_grad():
@@ -581,7 +586,7 @@ def run_quantization(
                 target_bits=head_rule["target_bits"]
             )
         else:
-            writer.add_unquantized_tensor("output.weight", W_head.cpu().numpy(), "F16")
+            writer.add_unquantized_tensor("output.weight", to_numpy_f16(W_head), "F16")
 
     # 8. Finalize .wsic Container
     print("\n[Assembly] Finalizing .wsic container...")
