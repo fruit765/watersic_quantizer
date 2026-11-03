@@ -10,28 +10,30 @@ import sys
 import gc
 import time
 import json
+import inspect
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-from core.profile_engine import QuantProfile
-from core.packing import pack_3bit, pack_4bit, pack_6bit, pack_8bit, pack_csr_outliers
-from core.wsic_writer import WsicContainerWriter
-from calibrate import get_calibration_dataset
-
-# Core WaterSIC (ZSIC) quantization module (bundled in core/zsic.py)
 try:
+    from core.profile_engine import QuantProfile
+    from core.packing import pack_3bit, pack_4bit, pack_6bit, pack_8bit, pack_csr_outliers
+    from core.wsic_writer import WsicContainerWriter
+    from calibrate import get_calibration_dataset
     from core.zsic import compress_zsic, ZSICConfig
     HAS_WATERSIC_LIB = True
 except ImportError:
     try:
-        sys.path.insert(0, str(Path(__file__).parent.parent / "watersic"))
-        from quant_layerwise.methods.zsic import compress_zsic, ZSICConfig
+        from watersic_quantizer.core.profile_engine import QuantProfile
+        from watersic_quantizer.core.packing import pack_3bit, pack_4bit, pack_6bit, pack_8bit, pack_csr_outliers
+        from watersic_quantizer.core.wsic_writer import WsicContainerWriter
+        from watersic_quantizer.calibrate import get_calibration_dataset
+        from watersic_quantizer.core.zsic import compress_zsic, ZSICConfig
         HAS_WATERSIC_LIB = True
     except ImportError:
         HAS_WATERSIC_LIB = False
@@ -156,6 +158,44 @@ def quantize_linear_layer_watersic(
     }
 
 
+def run_layer_forward(layer: nn.Module, h_in: torch.Tensor, rotary_emb: Optional[nn.Module] = None) -> torch.Tensor:
+    """
+    Safely invoke layer forward, automatically supplying position_embeddings / position_ids
+    if required by Qwen3.5 / MoE architectures.
+    """
+    sig = inspect.signature(layer.forward)
+    params = sig.parameters
+    kwargs = {}
+
+    if "position_embeddings" in params and rotary_emb is not None:
+        seq_l = h_in.shape[1]
+        p_ids = torch.arange(seq_l, device=h_in.device).unsqueeze(0).expand(h_in.shape[0], -1)
+        try:
+            pos_emb = rotary_emb(h_in, p_ids)
+        except Exception:
+            try:
+                # Qwen 3.5 multi-dimensional position ids (temporal, height, width)
+                p_ids_3d = p_ids.view(1, 1, -1).expand(3, h_in.shape[0], -1)
+                pos_emb = rotary_emb(h_in, p_ids_3d)
+            except Exception:
+                pos_emb = None
+        if pos_emb is not None:
+            kwargs["position_embeddings"] = pos_emb
+    elif "position_ids" in params:
+        seq_l = h_in.shape[1]
+        p_ids = torch.arange(seq_l, device=h_in.device).unsqueeze(0).expand(h_in.shape[0], -1)
+        kwargs["position_ids"] = p_ids
+
+    try:
+        out = layer(h_in, **kwargs)
+    except TypeError:
+        out = layer(h_in)
+
+    if isinstance(out, tuple):
+        return out[0]
+    return out
+
+
 def run_quantization(
     model_id: str,
     profile_path: str,
@@ -254,31 +294,47 @@ def run_quantization(
 
     # 5. Load Model Skeleton (layer-by-layer streaming)
     print("[Model] Initializing base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        torch_dtype=dtype,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        trust_remote_code=True
-    )
+    model_kwargs = {
+        "config": config,
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True
+    }
+    try:
+        import accelerate
+        model_kwargs["device_map"] = "cpu"
+    except ImportError:
+        pass
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
     model.eval()
 
     # Identify base components
     embed_tokens = model.get_input_embeddings()
     layers = model.model.layers if hasattr(model, "model") and hasattr(model.model, "layers") else []
     lm_head = model.get_output_embeddings()
+    rotary_emb = getattr(model, "rotary_emb", None)
+    if rotary_emb is None and hasattr(model, "model"):
+        rotary_emb = getattr(model.model, "rotary_emb", None)
 
     # Cache activations on CPU
     print(f"[Cache] Running token embeddings through calibration passages...")
-    hidden_size = config.hidden_size
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is None and hasattr(config, "get_text_config"):
+        hidden_size = config.get_text_config().hidden_size
+    if hidden_size is None and hasattr(config, "text_config"):
+        hidden_size = getattr(config.text_config, "hidden_size", None)
+    if hidden_size is None and hasattr(embed_tokens, "weight"):
+        hidden_size = embed_tokens.weight.shape[1]
+
     cached_h = torch.zeros((nsamples, seqlen, hidden_size), dtype=dtype, device="cpu")
 
+    emb_device = next(embed_tokens.parameters()).device
     with torch.no_grad():
         for i in range(nsamples):
-            tokens_batch = calib_tensor[i:i+1].to(primary_device)
+            tokens_batch = calib_tensor[i:i+1].to(emb_device)
             h = embed_tokens(tokens_batch)
-            cached_h[i] = h.cpu()
+            cached_h[i] = h.to("cpu")
             del tokens_batch, h
     gc.collect()
     if torch.cuda.is_available():
@@ -315,6 +371,8 @@ def run_quantization(
 
         # Move ONLY this layer to primary GPU for forward pass
         layer = layer.to(primary_device)
+        if rotary_emb is not None:
+            rotary_emb = rotary_emb.to(primary_device)
 
         # Find linear modules in layer
         layer_linears = {}
@@ -344,7 +402,7 @@ def run_quantization(
         with torch.no_grad():
             for i in range(nsamples):
                 h_in = cached_h[i:i+1].to(primary_device)
-                _ = layer(h_in)
+                _ = run_layer_forward(layer, h_in, rotary_emb)
                 del h_in
 
         for h in hooks:
@@ -435,14 +493,14 @@ def run_quantization(
         with torch.no_grad():
             for i in range(nsamples):
                 h_in = cached_h[i:i+1].to(primary_device)
-                h_out = layer(h_in)
-                if isinstance(h_out, tuple):
-                    h_out = h_out[0]
-                cached_h[i] = h_out.cpu()
+                h_out = run_layer_forward(layer, h_in, rotary_emb)
+                cached_h[i] = h_out.to("cpu")
                 del h_in, h_out
 
         # Offload layer back to CPU and free VRAM
         layer = layer.to("cpu")
+        if rotary_emb is not None:
+            rotary_emb = rotary_emb.to("cpu")
         del hessians, results
         gc.collect()
         for d in devices_list:
