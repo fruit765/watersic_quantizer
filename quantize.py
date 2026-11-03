@@ -224,6 +224,28 @@ def run_quantization(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Check for standalone chat_template.jinja if not already loaded into tokenizer
+    if getattr(tokenizer, "chat_template", None) is None:
+        local_jinja = os.path.join(model_id, "chat_template.jinja")
+        if os.path.exists(local_jinja):
+            with open(local_jinja, "r", encoding="utf-8") as f:
+                tokenizer.chat_template = f.read()
+            print("[Tokenizer] Loaded local chat_template.jinja into tokenizer.")
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
+                jinja_path = hf_hub_download(repo_id=model_id, filename="chat_template.jinja")
+                with open(jinja_path, "r", encoding="utf-8") as f:
+                    tokenizer.chat_template = f.read()
+                print("[Tokenizer] Downloaded and loaded chat_template.jinja from Hugging Face Hub.")
+            except Exception:
+                pass
+
+    if getattr(tokenizer, "chat_template", None):
+        print(f"[Tokenizer] Active Chat Template: Jinja2 template detected ({len(tokenizer.chat_template)} chars)")
+    else:
+        print("[Tokenizer] Active Chat Template: Standard Qwen XML tags fallback")
+
     # 3. Load Calibration Data
     calib_tensor = get_calibration_dataset(tokenizer, nsamples=nsamples, seqlen=seqlen)
 
