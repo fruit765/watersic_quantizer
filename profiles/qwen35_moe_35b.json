@@ -1,0 +1,73 @@
+{
+  "profile_name": "qwen35_moe_35b",
+  "model_type": "qwen3_5_moe",
+  "target_model": "huihui-ai/Huihui-Ornith-1.5-35B-A3B-abliterated",
+  "description": "Mixed-bitrate WaterSIC PTQ profile for Qwen3.5 MoE 35B-A3B with Vision Tower",
+  "rules": [
+    {
+      "pattern": ".*(attn_norm|ffn_norm|output_norm|ln_f|layernorm|norm|norm1|norm2).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "Normalizations (attn_norm, ffn_norm, output_norm) kept unquantized in original FP16/BF16"
+    },
+    {
+      "pattern": ".*(gate_inp|ffn_gate_inp|router|mlp\\.gate).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "Expert router gating logits kept unquantized in original FP16/BF16"
+    },
+    {
+      "pattern": ".*(bias|rope|rotary_emb|ssm_dt|ssm_a|ssm_b|inv_freq).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "1D biases and RoPE/SSM constants kept in original precision"
+    },
+    {
+      "pattern": ".*(embed_tokens|token_embd|wte).*",
+      "action": "watersic",
+      "target_bits": 4,
+      "dtype": "watersic_4b",
+      "description": "Input token embeddings quantized to 4-bit WaterSIC"
+    },
+    {
+      "pattern": ".*(lm_head|output\\.weight).*",
+      "action": "watersic",
+      "target_bits": 6,
+      "dtype": "watersic_6b",
+      "description": "LM output head quantized to 6-bit WaterSIC"
+    },
+    {
+      "pattern": ".*(visual|model\\.visual|vision|v\\.).*",
+      "action": "watersic",
+      "target_bits": 6,
+      "dtype": "watersic_6b",
+      "description": "Vision encoder / multimodal tower quantized to 6-bit WaterSIC"
+    },
+    {
+      "pattern": ".*(shared_expert|shared_experts).*",
+      "action": "watersic",
+      "target_bits": 4,
+      "dtype": "watersic_4b",
+      "description": "Shared experts quantized to 4-bit WaterSIC"
+    },
+    {
+      "pattern": ".*(q_proj|k_proj|v_proj|o_proj|attn_q|attn_k|attn_v|attn_output|in_proj_qkv|in_proj_z|out_proj).*",
+      "action": "watersic",
+      "target_bits": 4,
+      "dtype": "watersic_4b",
+      "description": "Attention projections quantized to 4-bit WaterSIC"
+    },
+    {
+      "pattern": ".*(experts\\.[0-9]+\\.(gate_proj|up_proj|down_proj)|ffn_gate_exps|ffn_up_exps|ffn_down_exps).*",
+      "action": "watersic",
+      "target_bits": 3,
+      "dtype": "watersic_3b",
+      "description": "Routed experts quantized to 3-bit WaterSIC"
+    }
+  ],
+  "default_action": "keep_original",
+  "default_bits": 0
+}

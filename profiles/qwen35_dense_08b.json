@@ -1,0 +1,45 @@
+{
+  "profile_name": "qwen35_dense_08b",
+  "model_type": "qwen3_5",
+  "target_model": "Qwen/Qwen3.5-0.8B",
+  "description": "Validation profile for Qwen3.5-0.8B matching native 3-bit WSIC container",
+  "rules": [
+    {
+      "pattern": ".*(attn_norm|ffn_norm|output_norm|ln_f|layernorm|norm|norm1|norm2).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "Layer normalizations kept in original FP16"
+    },
+    {
+      "pattern": ".*(bias|rope|rotary_emb|ssm_dt|ssm_a|ssm_b|in_proj_a|in_proj_b).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "SSM recurrent low-rank vectors and biases kept in original FP16"
+    },
+    {
+      "pattern": ".*(embed_tokens|token_embd|wte).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "Embeddings kept in FP16 for 0.8B baseline matching"
+    },
+    {
+      "pattern": ".*(lm_head|output\\.weight).*",
+      "action": "keep_original",
+      "target_bits": 0,
+      "dtype": "original",
+      "description": "LM head kept in FP16 for 0.8B baseline matching"
+    },
+    {
+      "pattern": ".*(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj).*",
+      "action": "watersic",
+      "target_bits": 3,
+      "dtype": "watersic_3b",
+      "description": "Linear projection layers quantized to 3-bit WaterSIC"
+    }
+  ],
+  "default_action": "keep_original",
+  "default_bits": 0
+}

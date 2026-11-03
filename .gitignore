@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Large binaries & temporary model artifacts
+*.wsic
+*.payload.tmp
+*.tmp
+*.pt
+*.bin
+*.safetensors
+*.gguf
+
+# Output directories
+output/
+runs/
+quant_runs/
+.cache/
+
+# IDE
+.vscode/
+.idea/
