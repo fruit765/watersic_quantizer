@@ -36,6 +36,72 @@ CHAT_CALIBRATION_SAMPLES = [
 ]
 
 
+def extract_token_ids(obj: Any, tokenizer: AutoTokenizer) -> List[int]:
+    """
+    Safely extract a flat list of integer token IDs from any tokenizer output format
+    (int list, raw formatted prompt string, PyTorch tensor, BatchEncoding, or nested list).
+    """
+    if obj is None:
+        return []
+    if isinstance(obj, str):
+        return tokenizer.encode(obj, add_special_tokens=False)
+    if isinstance(obj, torch.Tensor):
+        return [int(x) for x in obj.flatten().tolist()]
+    if hasattr(obj, "input_ids"):
+        return extract_token_ids(obj.input_ids, tokenizer)
+    if isinstance(obj, dict) and "input_ids" in obj:
+        return extract_token_ids(obj["input_ids"], tokenizer)
+    if isinstance(obj, (list, tuple)):
+        flat: List[int] = []
+        for item in obj:
+            if isinstance(item, int):
+                flat.append(item)
+            elif isinstance(item, str):
+                flat.extend(tokenizer.encode(item, add_special_tokens=False))
+            elif isinstance(item, (list, tuple, torch.Tensor)):
+                flat.extend(extract_token_ids(item, tokenizer))
+            else:
+                try:
+                    flat.append(int(item))
+                except (ValueError, TypeError):
+                    pass
+        return flat
+    try:
+        return [int(obj)]
+    except (ValueError, TypeError):
+        return tokenizer.encode(str(obj), add_special_tokens=False)
+
+
+def format_chat_message(sample: List[Dict[str, str]], tokenizer: AutoTokenizer) -> List[int]:
+    """
+    Format chat messages using native chat template, handling both tokenized list
+    and string outputs, with fallback to manual XML tags.
+    """
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        try:
+            res = tokenizer.apply_chat_template(sample, tokenize=True, add_generation_prompt=False)
+            ids = extract_token_ids(res, tokenizer)
+            if ids:
+                return ids
+        except Exception:
+            pass
+
+        try:
+            raw_text = tokenizer.apply_chat_template(sample, tokenize=False, add_generation_prompt=False)
+            if isinstance(raw_text, str) and raw_text:
+                return tokenizer.encode(raw_text, add_special_tokens=False)
+        except Exception:
+            pass
+
+    # Manual fallback to standard Qwen chat template tags
+    parts = []
+    for msg in sample:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    return tokenizer.encode("".join(parts), add_special_tokens=False)
+
+
 def get_calibration_dataset(
     tokenizer: AutoTokenizer,
     nsamples: int = 128,
@@ -45,7 +111,7 @@ def get_calibration_dataset(
 ) -> torch.Tensor:
     """
     Build tokenized calibration tensor of shape (nsamples, seqlen).
-    Formats samples through tokenizer.apply_chat_template to preserve native tokens.
+    Guarantees strictly integer token IDs in tensor output.
     """
     if output_cache_path and os.path.exists(output_cache_path):
         print(f"[Calib] Loading pre-tokenized calibration data from {output_cache_path}...")
@@ -57,14 +123,10 @@ def get_calibration_dataset(
     total_needed = nsamples * seqlen
 
     # 1. Format conversational chat samples using model's native chat template
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        print("  [Chat Template] Applying model's native chat template (<|im_start|>, <|im_end|>)...")
-        for sample in CHAT_CALIBRATION_SAMPLES:
-            try:
-                formatted_ids = tokenizer.apply_chat_template(sample, tokenize=True, add_generation_prompt=False)
-                collected_tokens.extend(formatted_ids)
-            except Exception as e:
-                print(f"  [Notice] apply_chat_template error ({e}), using raw text fallback")
+    print("  [Chat Template] Applying model's native chat template (<|im_start|>, <|im_end|>)...")
+    for sample in CHAT_CALIBRATION_SAMPLES:
+        ids = format_chat_message(sample, tokenizer)
+        collected_tokens.extend(ids)
 
     # 2. Try loading diverse multi-domain text from HuggingFace
     try:
@@ -76,20 +138,14 @@ def get_calibration_dataset(
         rng.shuffle(docs)
         
         for doc in docs:
-            if len(doc.strip()) > 50:
-                # Wrap passages in chat format so the model router sees conversational context
+            text_strip = doc.strip()
+            if len(text_strip) > 50:
                 chat_doc = [
-                    {"role": "user", "content": "Analyze and summarize this information:\n" + doc[:1000]},
-                    {"role": "assistant", "content": "<think>\nExtracting key points from passage...\n</think>\n" + doc[1000:2000]}
+                    {"role": "user", "content": "Analyze and summarize this information:\n" + text_strip[:1000]},
+                    {"role": "assistant", "content": "<think>\nExtracting key points from passage...\n</think>\n" + text_strip[1000:2000]}
                 ]
-                if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-                    try:
-                        ids = tokenizer.apply_chat_template(chat_doc, tokenize=True)
-                        collected_tokens.extend(ids)
-                    except Exception:
-                        collected_tokens.extend(tokenizer.encode(doc, add_special_tokens=False))
-                else:
-                    collected_tokens.extend(tokenizer.encode(doc, add_special_tokens=False))
+                ids = format_chat_message(chat_doc, tokenizer)
+                collected_tokens.extend(ids)
 
             if len(collected_tokens) >= total_needed:
                 break
@@ -97,14 +153,21 @@ def get_calibration_dataset(
         print(f"  [Note] Hugging Face datasets load skipped ({e}), expanding native chat pool...")
 
     # 3. Tile if more tokens needed
+    sample_idx = 0
     while len(collected_tokens) < total_needed:
-        for sample in CHAT_CALIBRATION_SAMPLES:
-            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-                ids = tokenizer.apply_chat_template(sample, tokenize=True)
-            else:
-                text = f"<|im_start|>user\n{sample[1]['content']}<|im_end|>\n<|im_start|>assistant\n{sample[2]['content']}<|im_end|>"
-                ids = tokenizer.encode(text)
-            collected_tokens.extend(ids)
+        sample = CHAT_CALIBRATION_SAMPLES[sample_idx % len(CHAT_CALIBRATION_SAMPLES)]
+        sample_idx += 1
+        ids = format_chat_message(sample, tokenizer)
+        if not ids:
+            ids = tokenizer.encode("Mixture of Experts WaterSIC progressive quantization token stream.\n", add_special_tokens=False)
+        collected_tokens.extend(ids)
+
+    # Final sanity check: strictly filter to integers
+    collected_tokens = [int(t) for t in collected_tokens if isinstance(t, int) or (isinstance(t, float) and t.is_integer())]
+
+    # If somehow fewer tokens, duplicate
+    while len(collected_tokens) < total_needed:
+        collected_tokens.extend(collected_tokens[:total_needed - len(collected_tokens)])
 
     # 4. Form (nsamples, seqlen) tensor
     tokens_tensor = torch.zeros((nsamples, seqlen), dtype=torch.long)
