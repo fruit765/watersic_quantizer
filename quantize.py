@@ -510,20 +510,8 @@ def run_quantization(
                 }
 
         results = []
-        if num_worker_gpus >= 2:
-            import concurrent.futures
-            # Split work across specified worker GPUs
-            print(f"  [Multi-GPU LDLQ] Dispatching {len(linear_items)} linear modules across {num_worker_gpus} GPUs ({', '.join(devices_list)})...")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_worker_gpus) as executor:
-                futures = []
-                for idx_m, item in enumerate(linear_items):
-                    assigned_device = devices_list[idx_m % num_worker_gpus]
-                    futures.append(executor.submit(quantize_single_mod, item, assigned_device))
-                for f in futures:
-                    results.append(f.result())
-        else:
-            for item in linear_items:
-                results.append(quantize_single_mod(item, primary_device))
+        for item in linear_items:
+            results.append(quantize_single_mod(item, primary_device))
 
         # Apply results back and write to .wsic
         for r in results:
