@@ -94,14 +94,66 @@ def quantize_linear_layer_watersic(
     W: torch.Tensor,
     Sig_X: torch.Tensor,
     target_bits: int,
-    percdamp: float = 0.001
+    percdamp: float = 0.001,
+    max_chunk_rows: int = 8192
 ) -> Dict[str, Any]:
     """
     Full WaterSIC (ZSIC) quantization with Cholesky decomposition, water-filling,
-    and CSR sparse outlier extraction.
+    and CSR sparse outlier extraction. Automatically chunks along rows if matrix
+    is too large to fit in VRAM (e.g. embeddings or LM head with 248k rows).
     """
     if not HAS_WATERSIC_LIB:
         return quantize_linear_layer_fallback(W, Sig_X, target_bits)
+
+    rows, cols = W.shape
+    target_device = Sig_X.device
+
+    # For massive matrices (e.g. vocab embeddings or lm_head with 248,320 rows),
+    # slice into row chunks of max_chunk_rows to prevent CUDA OOM on 16GB GPUs.
+    if rows > max_chunk_rows:
+        num_chunks = (rows + max_chunk_rows - 1) // max_chunk_rows
+        print(f"  [Memory-Safe Chunking] Tensor has {rows} rows (exceeds {max_chunk_rows}). Quantizing in {num_chunks} chunks to fit VRAM...", flush=True)
+
+        packed_chunks = []
+        t_vec_chunks = []
+        col_scales_list = []
+        dequant_chunks = []
+
+        for c_idx in range(num_chunks):
+            start_r = c_idx * max_chunk_rows
+            end_r = min(start_r + max_chunk_rows, rows)
+            w_chunk = W[start_r:end_r, :].to(target_device).contiguous()
+
+            res_c = quantize_linear_layer_watersic(
+                w_chunk, Sig_X, target_bits, percdamp=percdamp, max_chunk_rows=max_chunk_rows
+            )
+
+            packed_chunks.append(res_c["packed_qweight"])
+            dequant_chunks.append(res_c["dequant_weight"].to("cpu"))
+
+            chunk_rows = end_r - start_r
+            t_vec_chunks.append(res_c["scales_fp64"][:chunk_rows])
+            col_scales_list.append(res_c["scales_fp64"][chunk_rows:])
+
+            del w_chunk, res_c
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        total_packed = b"".join(packed_chunks)
+        full_t_vec = np.concatenate(t_vec_chunks)
+        avg_col_scales = np.mean(col_scales_list, axis=0)
+        combined_scales = np.concatenate([full_t_vec, avg_col_scales]).astype(np.float64)
+        full_dequant = torch.cat(dequant_chunks, dim=0).to(target_device)
+
+        return {
+            "packed_qweight": total_packed,
+            "scales_fp64": combined_scales,
+            "csr_bytes": b"",
+            "dequant_weight": full_dequant
+        }
+
+    # Ensure W is on target_device
+    W = W.to(target_device)
 
     cfg = ZSICConfig(
         target_rate_bits=float(target_bits),
@@ -133,7 +185,7 @@ def quantize_linear_layer_watersic(
     delta = Z - Z_clamped
     nz_rows, nz_cols = np.nonzero(delta)
     num_outliers = len(nz_rows)
-    
+
     csr_bytes = b""
     if num_outliers > 0:
         row_counts = np.bincount(nz_rows, minlength=rows)
@@ -346,7 +398,7 @@ def run_quantization(
     if emb_rule["action"] == "watersic":
         W_emb = embed_tokens.weight.data
         Sig_emb = torch.eye(W_emb.shape[1], dtype=torch.float64, device=primary_device)
-        res = quantize_linear_layer_watersic(W_emb.to(primary_device), Sig_emb, emb_rule["target_bits"])
+        res = quantize_linear_layer_watersic(W_emb, Sig_emb, emb_rule["target_bits"])
         writer.add_quantized_watersic_tensor(
             "token_embd.weight",
             list(W_emb.shape),
@@ -519,7 +571,7 @@ def run_quantization(
         W_head = lm_head.weight.data
         if head_rule["action"] == "watersic":
             Sig_head = torch.eye(W_head.shape[1], dtype=torch.float64, device=primary_device)
-            res_head = quantize_linear_layer_watersic(W_head.to(primary_device), Sig_head, head_rule["target_bits"])
+            res_head = quantize_linear_layer_watersic(W_head, Sig_head, head_rule["target_bits"])
             writer.add_quantized_watersic_tensor(
                 "output.weight",
                 list(W_head.shape),
