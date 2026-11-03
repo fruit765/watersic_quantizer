@@ -162,15 +162,55 @@ def run_quantization(
     output_wsic: str,
     nsamples: int = 128,
     seqlen: int = 2048,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    devices: Any = "auto",
+    device: Any = None,  # For backward-compatibility with device="cuda:0"
+    dtype = None
 ):
+    # Backward compatibility: if user passed device="cuda:0" or similar
+    if device is not None and devices == "auto":
+        devices = device
+
+    # Parse and resolve target devices
+    if devices == "auto" or devices is None:
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            devices_list = [f"cuda:{i}" for i in range(count)]
+        else:
+            devices_list = ["cpu"]
+    elif isinstance(devices, str):
+        if "," in devices:
+            devices_list = [d.strip() for d in devices.split(",") if d.strip()]
+        elif devices.lower() == "auto":
+            count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            devices_list = [f"cuda:{i}" for i in range(count)] if count > 0 else ["cpu"]
+        else:
+            devices_list = [devices.strip()]
+    elif isinstance(devices, (list, tuple)):
+        devices_list = list(devices)
+    else:
+        devices_list = ["cuda:0"] if torch.cuda.is_available() else ["cpu"]
+
+    primary_device = devices_list[0]
+    num_worker_gpus = len(devices_list)
+
+    if dtype is None:
+        dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+
     print("=" * 80)
-    print(f"WATERSIC PROGRESSIVE LAYER-BY-LAYER QUANTIZER")
+    print("WATERSIC PROGRESSIVE LAYER-BY-LAYER QUANTIZER")
     print(f"Model ID:     {model_id}")
     print(f"Profile:      {profile_path}")
     print(f"Output WSIC:  {output_wsic}")
-    print(f"Hardware:     {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    if num_worker_gpus > 1 and all("cuda" in d for d in devices_list):
+        gpu_details = [f"{d} ({torch.cuda.get_device_name(int(d.split(':')[-1]))})" for d in devices_list]
+        print(f"Hardware:     Multi-GPU Mode active across {num_worker_gpus} GPUs:")
+        for idx_d, d_str in enumerate(gpu_details):
+            role = "Primary (Forward pass + LDLQ Worker)" if idx_d == 0 else "LDLQ Worker"
+            print(f"              [{idx_d}] {d_str} -> {role}")
+        print(f"Parallelism:  ThreadPoolExecutor(max_workers={num_worker_gpus}) for concurrent MoE experts")
+    else:
+        dev_desc = torch.cuda.get_device_name(0) if (torch.cuda.is_available() and "cuda" in primary_device) else "CPU"
+        print(f"Hardware:     Single-Device Mode on {primary_device} ({dev_desc})")
     print("=" * 80)
 
     # 1. Load Profile
@@ -214,20 +254,21 @@ def run_quantization(
 
     with torch.no_grad():
         for i in range(nsamples):
-            tokens_batch = calib_tensor[i:i+1].to(device)
+            tokens_batch = calib_tensor[i:i+1].to(primary_device)
             h = embed_tokens(tokens_batch)
             cached_h[i] = h.cpu()
             del tokens_batch, h
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Handle input embeddings quantization if requested by profile
     emb_rule = profile.match_tensor("token_embd.weight")
     print(f"[Embeddings] {emb_rule['action']} ({emb_rule['target_bits']} bits)")
     if emb_rule["action"] == "watersic":
         W_emb = embed_tokens.weight.data
-        Sig_emb = torch.eye(W_emb.shape[1], dtype=torch.float64, device=device)
-        res = quantize_linear_layer_watersic(W_emb.to(device), Sig_emb, emb_rule["target_bits"])
+        Sig_emb = torch.eye(W_emb.shape[1], dtype=torch.float64, device=primary_device)
+        res = quantize_linear_layer_watersic(W_emb.to(primary_device), Sig_emb, emb_rule["target_bits"])
         writer.add_quantized_watersic_tensor(
             "token_embd.weight",
             list(W_emb.shape),
@@ -241,10 +282,9 @@ def run_quantization(
 
     # 6. Progressive Layer-by-Layer Quantization
     num_layers = len(layers)
-    num_gpus = torch.cuda.device_count()
     print(f"\n[Layers] Starting streaming quantization of {num_layers} layers...")
-    if num_gpus >= 2:
-        print(f"[Multi-GPU] Detected {num_gpus} GPUs. Parallelizing WaterSIC expert LDLQ across cuda:0 and cuda:1!")
+    if num_worker_gpus >= 2:
+        print(f"[Multi-GPU] Detected {num_worker_gpus} GPUs. Parallelizing WaterSIC expert LDLQ across {', '.join(devices_list)}!")
 
     for layer_idx in range(num_layers):
         layer = layers[layer_idx]
@@ -252,7 +292,6 @@ def run_quantization(
         t0_layer = time.time()
 
         # Move ONLY this layer to primary GPU for forward pass
-        primary_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         layer = layer.to(primary_device)
 
         # Find linear modules in layer
@@ -303,7 +342,12 @@ def run_quantization(
 
             if m_rule["action"] == "watersic":
                 t_bits = m_rule["target_bits"]
-                with torch.cuda.device(target_gpu):
+                if "cuda" in target_gpu and torch.cuda.is_available():
+                    with torch.cuda.device(target_gpu):
+                        w_gpu = w_orig.to(target_gpu)
+                        sig_gpu = hessians[m_name].to(target_gpu)
+                        q_res = quantize_linear_layer_watersic(w_gpu, sig_gpu, t_bits)
+                else:
                     w_gpu = w_orig.to(target_gpu)
                     sig_gpu = hessians[m_name].to(target_gpu)
                     q_res = quantize_linear_layer_watersic(w_gpu, sig_gpu, t_bits)
@@ -329,13 +373,14 @@ def run_quantization(
                 }
 
         results = []
-        if num_gpus >= 2:
+        if num_worker_gpus >= 2:
             import concurrent.futures
-            # Split work across GPU 0 and GPU 1
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Split work across specified worker GPUs
+            print(f"  [Multi-GPU LDLQ] Dispatching {len(linear_items)} linear modules across {num_worker_gpus} GPUs ({', '.join(devices_list)})...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_worker_gpus) as executor:
                 futures = []
                 for idx_m, item in enumerate(linear_items):
-                    assigned_device = f"cuda:{idx_m % 2}"
+                    assigned_device = devices_list[idx_m % num_worker_gpus]
                     futures.append(executor.submit(quantize_single_mod, item, assigned_device))
                 for f in futures:
                     results.append(f.result())
@@ -378,7 +423,11 @@ def run_quantization(
         layer = layer.to("cpu")
         del hessians, results
         gc.collect()
-        torch.cuda.empty_cache()
+        for d in devices_list:
+            if "cuda" in d and torch.cuda.is_available():
+                gpu_id = int(d.split(":")[-1])
+                with torch.cuda.device(gpu_id):
+                    torch.cuda.empty_cache()
 
         elapsed = time.time() - t0_layer
         print(f"  Completed Layer {layer_idx + 1} in {elapsed:.2f}s")
@@ -389,8 +438,8 @@ def run_quantization(
         print(f"\n[LM Head] {head_rule['action']} ({head_rule['target_bits']} bits)")
         W_head = lm_head.weight.data
         if head_rule["action"] == "watersic":
-            Sig_head = torch.eye(W_head.shape[1], dtype=torch.float64, device=device)
-            res_head = quantize_linear_layer_watersic(W_head.to(device), Sig_head, head_rule["target_bits"])
+            Sig_head = torch.eye(W_head.shape[1], dtype=torch.float64, device=primary_device)
+            res_head = quantize_linear_layer_watersic(W_head.to(primary_device), Sig_head, head_rule["target_bits"])
             writer.add_quantized_watersic_tensor(
                 "output.weight",
                 list(W_head.shape),
@@ -417,6 +466,7 @@ def main():
     parser.add_argument("--output_wsic", type=str, required=True, help="Target .wsic file path")
     parser.add_argument("--nsamples", type=int, default=64, help="Number of calibration samples")
     parser.add_argument("--seqlen", type=int, default=2048, help="Tokens per calibration sample")
+    parser.add_argument("--devices", type=str, default="auto", help="Devices to use, e.g. 'auto', 'cuda:0,cuda:1', or 'cpu'")
     args = parser.parse_args()
 
     run_quantization(
@@ -424,7 +474,8 @@ def main():
         profile_path=args.profile,
         output_wsic=args.output_wsic,
         nsamples=args.nsamples,
-        seqlen=args.seqlen
+        seqlen=args.seqlen,
+        devices=args.devices
     )
 
 

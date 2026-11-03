@@ -38,7 +38,8 @@ python quantize.py \
     --profile "${PROFILE_PATH}" \
     --output_wsic "${OUTPUT_WSIC}" \
     --nsamples 64 \
-    --seqlen 2048
+    --seqlen 2048 \
+    --devices "cuda:0,cuda:1"
 
 # 6. Verify Output
 echo "[4/4] Verifying output container..."
