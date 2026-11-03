@@ -125,6 +125,11 @@ import sys
 import os
 import torch
 
+# Принудительная перезагрузка модулей Python (гарантирует применение обновлений из git)
+for mod in list(sys.modules.keys()):
+    if "watersic_quantizer" in mod:
+        del sys.modules[mod]
+
 # Добавляем модуль квантизатора в пути поиска Python
 sys.path.insert(0, "/kaggle/working/watersic_quantizer")
 
